@@ -1,0 +1,76 @@
+{
+  "name": "codebase-index",
+  "displayName": "Codebase Index & C/C++ Jump",
+  "description": "复刻 Cursor codebase-indexing 语义检索 + clangd C/C++ 搜索跳转的本地 VS Code 扩展",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onCommand:codebaseIndex.indexWorkspace",
+    "onCommand:codebaseIndex.semanticSearch",
+    "onCommand:codebaseIndex.searchSymbol",
+    "onCommand:codebaseIndex.goToDefinition",
+    "onCommand:codebaseIndex.textSearch"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codebaseIndex.indexWorkspace",
+        "title": "Codebase Index: 索引工作区"
+      },
+      {
+        "command": "codebaseIndex.semanticSearch",
+        "title": "Codebase Index: 语义搜索代码"
+      },
+      {
+        "command": "codebaseIndex.searchSymbol",
+        "title": "Codebase Index: 搜索符号 (C/C++)"
+      },
+      {
+        "command": "codebaseIndex.goToDefinition",
+        "title": "Codebase Index: 跳转到定义 (C/C++)"
+      },
+      {
+        "command": "codebaseIndex.textSearch",
+        "title": "Codebase Index: 全文搜索 (ripgrep)"
+      }
+    ],
+    "configuration": {
+      "title": "Codebase Index",
+      "properties": {
+        "codebaseIndex.clangdPath": {
+          "type": "string",
+          "default": "clangd",
+          "description": "clangd 可执行文件路径"
+        },
+        "codebaseIndex.embeddingModel": {
+          "type": "string",
+          "default": "jinaai/jina-embeddings-v2-base-code",
+          "description": "本地 embedding 模型（代码专用 jina-code 精度最高；备选 Xenova/bge-m3）"
+        },
+        "codebaseIndex.embeddingProxy": {
+          "type": "string",
+          "default": "",
+          "description": "下载 embedding 模型的 HTTP 代理（如 http://127.0.0.1:7897）；留空则不使用"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "@xenova/transformers": "^2.17.2",
+    "tree-sitter-c": "^0.24.1",
+    "tree-sitter-cpp": "^0.23.4",
+    "undici": "^8.11.2",
+    "web-tree-sitter": "^0.27.1"
+  }
+}

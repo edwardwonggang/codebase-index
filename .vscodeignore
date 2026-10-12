@@ -1,0 +1,9 @@
+# 打包扩展时排除测试和源码无关文件
+**/.git/**
+**/.gitignore
+**/.vscodeignore
+**/*.vsix
+**/test-*.js
+**/.codebase-index/**
+node_modules/.cache/**
+**/README.md

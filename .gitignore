@@ -1,0 +1,11 @@
+# 依赖
+node_modules/
+
+# VS Code 扩展打包产物
+*.vsix
+
+# 运行态索引状态（Merkle 增量 / 向量持久化）
+.codebase-index/
+
+# 系统文件
+.DS_Store
