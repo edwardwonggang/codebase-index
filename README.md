@@ -1,5 +1,8 @@
 # Codebase Index & C/C++ Jump — VS Code 扩展
 
+> 🪟 **Windows 用户请先看 [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) 安装指南**（git clone + npm install + F5）
+
+
 复刻 Cursor 核心能力的本地 VS Code 扩展，适用于 **Windows + VS Code + 代码/编译工具在 Linux 服务器（网络挂载 X 盘）** 的开发环境。
 
 1. **C/C++ 搜索与跳转**（符号搜索 + 定义跳转）— 通过 **clangd LSP**
