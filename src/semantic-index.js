@@ -1,14 +1,17 @@
-// semantic-index.js — Cursor codebase-indexing 本地复刻（语义检索引擎 + Merkle 增量索引）
-// 职责：tree-sitter 语法感知分块 + 代码专用 embedding + 余弦 KNN 检索 + Merkle 增量同步
+// semantic-index.js — Cursor codebase-indexing 本地复刻（语义检索引擎 + 向量库 + Merkle 增量）
+// 职责：tree-sitter 语法感知分块 + 代码专用 embedding + sqlite-vec 向量库 KNN 检索 + rerank + Merkle 增量同步
 // 调用方：extension.js（indexWorkspace / semanticSearch 命令）
-// 依赖：web-tree-sitter（分块）、@huggingface/transformers（代码专用 embedding）、node:crypto
+// 依赖：web-tree-sitter（分块）、@huggingface/transformers（代码专用 embedding）、
+//       ./vector-store（sqlite-vec 向量库 + better-sqlite3）、node:crypto
 // 红线：
 //   - embedding 必须用代码专用模型（jina-code），通用模型（gte/bge）检索精度差（PoC 实测 2/4 vs 4/4）
-//   - Merkle 增量：只在文件哈希变化时重新索引，避免全量扫描慢速网络挂载盘（X 盘）
-//   - 首次索引走全量；后续走增量（对比文件 SHA-256，只处理新增/修改）
+//   - 向量必须落 sqlite-vec 库（vec.db），不用 JSON 存全量向量 —— 大仓库重启会内存/加载膨胀（旧实现教训）
+//   - Merkle 增量：文件级 SHA-256 定位变化文件 + 目录级子树哈希快速跳过未变子树（慢速 X 盘优化）
+//   - vec0 维度在建表时固定，embedding 维度变化须重建（见 vector-store 红线）
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { VectorStore } = require('./vector-store');
 
 // tree-sitter 语言 wasm 路径（按需注册）
 const LANG_WASM = {
@@ -22,6 +25,8 @@ const CHUNK_TYPES = {
 };
 // 容器节点（namespace 等）：深入遍历，不作为块边界
 const CONTAINERS = new Set(['namespace_definition', 'translation_unit']);
+// rerank 融合权重：向量相似度占 0.7，词元重叠占 0.3（可配，兼顾语义与精确标识符匹配）
+const RERANK_VEC_WEIGHT = 0.7;
 
 class SemanticIndex {
   constructor(opts) {
@@ -31,12 +36,16 @@ class SemanticIndex {
     this.embeddingBackup = 'Xenova/bge-m3';
     this.workspaceRoot = opts.workspaceRoot || null;
     this.proxy = opts.proxy || null;
-    this.chunks = [];      // 内存中的已索引块（含 vec）
-    this.merkleState = {}; // { filePath: sha256 }
+    this.chunks = [];      // 索引块元数据缓存（不含 vec，vec 在数据库）；兼容旧 chunks.length 用法
+    this.merkleState = {}; // { filePath: sha256 } 文件级 Merkle 叶子哈希（定位变化文件）
+    this.dirMerkle = {};   // { dirPath: sha256 } 目录级子树哈希（真 Merkle 树：快速跳过未变子树）
     this.parser = null;
     this._Parser = null;
     this.langs = {};
     this.statusFile = null;
+    this.dbFile = null;
+    this.embedder = null;
+    this.store = null;
   }
 
   async init() {
@@ -61,13 +70,30 @@ class SemanticIndex {
       console.warn(`embedding 主模型 ${this.embeddingModel} 加载失败，回退 ${this.embeddingBackup}: ${e.message}`);
       this.embedder = await pipeline('feature-extraction', this.embeddingBackup);
     }
-    // 状态文件（Merkle 增量持久化）
+    // 状态文件 + 向量库文件（Merkle 增量 + 向量持久化）
     if (this.workspaceRoot) {
       const stateDir = path.join(this.workspaceRoot, '.codebase-index');
       fs.mkdirSync(stateDir, { recursive: true });
       this.statusFile = path.join(stateDir, 'merkle-state.json');
+      this.dbFile = path.join(stateDir, 'vec.db');
       this._loadMerkleState();
+      // 重启恢复：若已有向量库，用已存维度打开可写 store + 恢复块元数据缓存
+      this._restoreChunkMeta();
     }
+  }
+
+  // 从向量库恢复：打开可写 store（用已存维度）+ 恢复块元数据缓存（不含 vec）
+  // 这样重启后 store 非空，既能直接读（语义检索）又能增量写（重索引）
+  _restoreChunkMeta() {
+    try {
+      if (this.dbFile && fs.existsSync(this.dbFile)) {
+        const dim = new VectorStore(this.dbFile).detectDim();
+        if (dim > 0) {
+          this.store = new VectorStore(this.dbFile).init(dim);
+          this.chunks = this.store.allMeta();
+        }
+      }
+    } catch { /* 库损坏/维度异常时忽略，首次索引会重建 */ }
   }
 
   _loadMerkleState() {
@@ -75,16 +101,16 @@ class SemanticIndex {
       if (this.statusFile && fs.existsSync(this.statusFile)) {
         const data = JSON.parse(fs.readFileSync(this.statusFile, 'utf8'));
         this.merkleState = data.merkle || {};
-        // 恢复持久化的向量块（避免重启后重新 embedding）
-        if (Array.isArray(data.chunks)) this.chunks = data.chunks;
+        this.dirMerkle = data.dirMerkle || {};
       }
-    } catch { this.merkleState = {}; }
+    } catch { this.merkleState = {}; this.dirMerkle = {}; }
   }
 
   _saveMerkleState() {
     try {
       if (this.statusFile) {
-        fs.writeFileSync(this.statusFile, JSON.stringify({ merkle: this.merkleState, chunks: this.chunks }, null, 1));
+        // 只存 Merkle 哈希；向量在 vec.db，不再存 JSON（避免大仓库 JSON 膨胀）
+        fs.writeFileSync(this.statusFile, JSON.stringify({ merkle: this.merkleState, dirMerkle: this.dirMerkle }, null, 1));
       }
     } catch (e) { console.warn('保存索引状态失败:', e.message); }
   }
@@ -94,11 +120,18 @@ class SemanticIndex {
     return crypto.createHash('sha256').update(content).digest('hex');
   }
 
-  // 目录 Merkle 哈希（子项哈希排序后组合哈希；用于判断目录是否变化）
+  // 目录 Merkle 子树哈希：子项哈希（文件名:哈希）排序后组合哈希 —— 真 Merkle 树内部节点
+  // 子项哈希来自「文件内容哈希」或「子目录子树哈希」，因此目录哈希变化 ⇔ 其下任何文件/子树变化
   _dirHash(entries) {
     const h = crypto.createHash('sha256');
     for (const e of entries.sort()) h.update(e);
     return h.digest('hex');
+  }
+
+  // 计算某目录下子项的「名称:哈希」列表（供 dirHash 用）
+  // itemHashes: [{ name, hash }]，hash 对文件是内容哈希，对子目录是子树哈希
+  _dirEntries(itemHashes) {
+    return itemHashes.map(({ name, hash }) => `${name}:${hash}`);
   }
 
   async _loadLang(lang) {
@@ -111,18 +144,50 @@ class SemanticIndex {
     return this.langs[lang];
   }
 
+  // embedding 文本 → 向量；首次调用确定维度并初始化向量库
   async _embed(text) {
     const out = await this.embedder(text, { pooling: 'mean', normalize: true });
+    const dim = out.data.length;
+    if (!this.store && this.dbFile) {
+      this.store = new VectorStore(this.dbFile).init(dim);
+    }
     return Array.from(out.data);
   }
 
-  _cosine(a, b) {
-    let dot = 0, na = 0, nb = 0;
-    for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
-    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  // 查询 token 化（用于 rerank 词元重叠）：小写 + 按非字母数字切分
+  _tokenize(text) {
+    const toks = String(text).toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length > 1);
+    return Array.from(new Set(toks));
   }
 
-  // 对单个文件做 tree-sitter 分块 + embedding（返回新块数组）
+  // rerank：对向量初选结果做混合精排（向量相似度 + 查询词元与代码内容重叠度）
+  // 对标 Cursor 的 rerank 环节；本地用轻量 hybrid（语义 + 稀疏标识符匹配）替代交叉编码器
+  _rerank(query, candidates) {
+    const qTokens = this._tokenize(query);
+    if (qTokens.length === 0) return candidates;
+    for (const c of candidates) {
+      const content = (c.content || '').toLowerCase();
+      let overlap = 0;
+      for (const t of qTokens) {
+        if (content.includes(t)) overlap++;
+        // 额外加分：块首行（通常是函数签名）命中权重更高
+        const firstLine = content.split('\n')[0] || '';
+        if (firstLine.includes(t)) overlap += 0.5;
+      }
+      const tokenScore = Math.min(1, overlap / qTokens.length);
+      c.score = RERANK_VEC_WEIGHT * c.score + (1 - RERANK_VEC_WEIGHT) * tokenScore;
+    }
+    return candidates.sort((a, b) => b.score - a.score);
+  }
+
+  async _loadLangAndParse(lang, src) {
+    const langObj = await this._loadLang(lang);
+    if (!langObj) return null;
+    this.parser.setLanguage(langObj);
+    return this.parser.parse(src);
+  }
+
+  // 对单个文件做 tree-sitter 分块 + embedding（返回新块数组，含 vec）
   async _chunkAndEmbed(filePath, lang) {
     const langObj = await this._loadLang(lang);
     if (!langObj) return [];
@@ -143,40 +208,49 @@ class SemanticIndex {
       const content = src.slice(n.startIndex, n.endIndex).trim();
       if (!content || content.length < 8) continue;
       const vec = await this._embed(content);
-      out.push({
-        id: 0, path: filePath, lang,
-        start: n.startPosition.row + 1, end: n.endPosition.row + 1,
-        content, vec,
-      });
+      out.push({ path: filePath, lang, start: n.startPosition.row + 1, end: n.endPosition.row + 1, content, vec });
     }
     return out;
   }
 
-  // 移除某文件的所有块（Merkle 删除时）
-  _removeFileChunks(filePath) {
-    this.chunks = this.chunks.filter(c => c.path !== filePath);
-  }
-
-  // 索引一个文件（更新内存 + Merkle 状态）。返回新增块数。
+  // 索引一个文件：删除旧块 → 重新分块+embedding → 写入向量库 → 更新 Merkle 哈希。返回新增块数。
   async indexFile(filePath, lang) {
     let src;
     try { src = fs.readFileSync(filePath, 'utf8'); } catch { return 0; }
     const hash = this._fileHash(src);
     const oldHash = this.merkleState[filePath];
-    const inMemory = this.chunks.some(c => c.path === filePath);
-    // Merkle 增量：哈希未变且内存中已有该文件块 → 跳过（避免重扫慢速网络盘）
-    // 但重启后内存为空时，即使哈希未变也需重建内存块（否则 chunks 永远空）
-    if (oldHash === hash && inMemory) return 0;
-    // 移除旧块，重新分块+embedding
+    const inStore = this.store ? this.store.count() >= 0 && this._hasPath(filePath) : this._hasPath(filePath);
+    // Merkle 增量：文件哈希未变且向量库中已有该文件块 → 跳过（避免重扫慢速网络盘 + 重复 embedding）
+    if (oldHash === hash && inStore) return 0;
+    // 重索引：先清该文件旧块（向量库 + 元数据缓存），再分块+embedding
     this._removeFileChunks(filePath);
     const newChunks = await this._chunkAndEmbed(filePath, lang);
-    for (const c of newChunks) { c.id = this.chunks.length; this.chunks.push(c); }
+    if (this.store) {
+      for (const c of newChunks) {
+        this.store.upsert({ path: c.path, lang: c.lang, start: c.start, end: c.end, content: c.content }, c.vec);
+      }
+      // 更新元数据缓存
+      this.chunks = this.chunks.filter((x) => x.path !== filePath);
+      for (const c of newChunks) this.chunks.push({ path: c.path, lang: c.lang, start: c.start, end: c.end });
+    }
     this.merkleState[filePath] = hash;
     this._saveMerkleState();
     return newChunks.length;
   }
 
-  // 移除一个已删除的文件（Merkle 删除路径）
+  // 向量库中是否已有该 path 的块
+  _hasPath(filePath) {
+    if (!this.store) return this.chunks.some((c) => c.path === filePath);
+    return this.store.hasPath(filePath);
+  }
+
+  // 移除某文件的所有块（向量库 + 元数据缓存 + Merkle 删除）
+  _removeFileChunks(filePath) {
+    if (this.store) this.store.removeByPath(filePath);
+    this.chunks = this.chunks.filter((c) => c.path !== filePath);
+  }
+
+  // 移除一个已删除的文件
   removeFile(filePath) {
     this._removeFileChunks(filePath);
     if (this.merkleState[filePath]) {
@@ -185,46 +259,98 @@ class SemanticIndex {
     }
   }
 
-  // 增量索引：对给定文件列表，只处理 Merkle 变化的部分。返回统计。
-  // 说明：Merkle 树是「文件哈希字典」，目录树哈希用于可选的整体校验；此处用文件级哈希做增量，
-  //       避免全量重扫慢速网络挂载盘（X 盘）。返回 {indexed, unchanged, removed, chunks}
-  async incrementalIndex(fileList, detectLang) {
-    const stats = { indexed: 0, unchanged: 0, removed: 0, chunks: 0 };
-    const seen = new Set();
-    for (const f of fileList) {
-      seen.add(f);
-      const lang = detectLang ? detectLang(f) : (f.endsWith('.c') ? 'c' : 'cpp');
-      const n = await this.indexFile(f, lang);
-      if (n === 0) {
-        // n===0 可能是「未变化」或「无块」；区分：查 Merkle 是否有该文件记录
-        if (this.merkleState[f]) stats.unchanged++;
-        else stats.indexed++; // 新增但无块（空文件等）
-      } else { stats.indexed++; stats.chunks += n; }
+  // 计算目录下所有 C/C++ 文件内容哈希的组合哈希（该目录的 Merkle 子树哈希）
+  // 目录内任一文件内容变化 → 子树哈希变化；用于「目录未变则整目录跳过」
+  // 不递归子目录内容（子目录由各自目录哈希独立判断），文件级 Merkle 仍兜底精确定位变化文件
+  _computeDirHash(dirPath, files, detectLang) {
+    const entries = [];
+    for (const f of files) {
+      let src;
+      try { src = fs.readFileSync(f, 'utf8'); } catch { continue; }
+      entries.push(`${path.basename(f)}:${this._fileHash(src)}`);
     }
-    // Merkle 清理：删除不在列表中的文件
+    return this._dirHash(entries);
+  }
+
+  // 增量索引：目录级 Merkle 子树哈希快速跳过未变目录 + 文件级哈希精确定位变化文件。
+  // 返回统计（含 dirsSkipped：整目录未变而跳过的目录数）。
+  // 价值：慢速 X 盘上目录未变时无需逐个文件重算 embedding / 重复读盘。
+  async incrementalIndex(fileList, detectLang, onProgress) {
+    const stats = { indexed: 0, unchanged: 0, removed: 0, chunks: 0, dirsSkipped: 0 };
+    const byDir = new Map();
+    for (const f of fileList) {
+      const dir = path.dirname(f);
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir).push(f);
+    }
+    const seen = new Set();
+    const curDirs = new Set();
+    let doneDirs = 0;
+    const totalDirs = byDir.size;
+    for (const [dir, files] of byDir) {
+      curDirs.add(dir);
+      doneDirs++;
+      // 目录级 Merkle：算该目录子树哈希，未变则整目录跳过（不读文件内容、不跑 embedding）
+      const dirHash = this._computeDirHash(dir, files, detectLang);
+      if (this.dirMerkle[dir] === dirHash) {
+        for (const f of files) { seen.add(f); stats.unchanged++; }
+        stats.dirsSkipped++;
+        continue;
+      }
+      // 目录变了：逐个文件精确处理（文件级 Merkle 跳过未变文件，只重索引变化的）
+      for (const f of files) {
+        seen.add(f);
+        const lang = detectLang ? detectLang(f) : (f.endsWith('.c') ? 'c' : 'cpp');
+        const n = await this.indexFile(f, lang);
+        if (n === 0) {
+          if (this.merkleState[f]) stats.unchanged++;
+          else stats.indexed++;
+        } else { stats.indexed++; stats.chunks += n; }
+      }
+      this.dirMerkle[dir] = dirHash;
+      if (onProgress) onProgress({ doneDirs, totalDirs, stats });
+    }
+    // 清理已删除文件
     for (const f of Object.keys(this.merkleState)) {
       if (!seen.has(f)) { this.removeFile(f); stats.removed++; }
     }
+    // 清理已不存在的目录（Merkle 树目录节点删除）
+    for (const d of Object.keys(this.dirMerkle)) {
+      if (!curDirs.has(d)) delete this.dirMerkle[d];
+    }
+    this._saveMerkleState();
     return stats;
   }
 
-  // 语义搜索：query → embedding → KNN 余弦 → 返回最相关块（按文件聚合，避免声明/定义重复）
+  // 语义搜索：query → embedding → 向量库 KNN 初选 topN → rerank 精排 → 返回块
   async search(query, topK = 5) {
-    const qv = await this._embed(query);
-    const scored = this.chunks
-      .map((c) => ({ ...c, score: this._cosine(qv, c.vec) }))
-      .sort((a, b) => b.score - a.score);
-    // 按文件聚合：同一文件只保留最高分块（Cursor 返回路径+行号，用户按文件跳转）
-    const byFile = new Map();
-    for (const c of scored) {
-      if (!byFile.has(c.path) || c.score > byFile.get(c.path).score) {
-        byFile.set(c.path, c);
-      }
+    if (!this.store) {
+      // 未初始化向量库（未索引过）
+      return [];
     }
-    return Array.from(byFile.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK)
-      .map(({ score, ...rest }) => ({ ...rest, score: Number(score.toFixed(4)) }));
+    const qv = await this._embed(query);
+    // KNN 初选一个较大的候选池（如 3*topK），交给 rerank 精排
+    const poolSize = Math.max(10, topK * 3);
+    const rows = this.store.search(qv, poolSize);
+    const candidates = rows.map((r) => ({
+      id: r.id, path: r.path, lang: r.lang, start: r.start, end: r.end, content: r.content,
+      // vec0 distance 越小越相似 → 转相似度分数（0~1）
+      score: Math.max(0, 1 - r.distance),
+    }));
+    // 按文件聚合：同一文件只保留最高分块
+    const byFile = new Map();
+    for (const c of candidates) {
+      if (!byFile.has(c.path) || c.score > byFile.get(c.path).score) byFile.set(c.path, c);
+    }
+    let merged = Array.from(byFile.values()).sort((a, b) => b.score - a.score);
+    // rerank 精排
+    merged = this._rerank(query, merged);
+    return merged.slice(0, topK).map(({ score, ...rest }) => ({ ...rest, score: Number(score.toFixed(4)) }));
+  }
+
+  // 关闭向量库连接（索引完成后释放资源）
+  close() {
+    if (this.store) { this.store.close(); this.store = null; }
   }
 }
 

@@ -25,10 +25,24 @@ cd codebase-index
 ```bash
 npm install
 ```
-> ⚠️ 如果下载慢/失败（尤其 transformers 相关），先配置 npm 镜像：
+> ⚠️ 如果下载慢/失败，先配置 npm 镜像：
 > ```bash
 > npm config set registry https://registry.npmmirror.com
 > ```
+
+> ⚠️ **`better-sqlite3` 是原生模块，prebuild 默认从 GitHub 下载**。公司电脑无法访问国外时，
+> 在 `npm install` 前先指向国内 prebuild 镜像（npmmirror 已镜像 better-sqlite3 prebuild）：
+> ```bash
+> # Windows cmd（设置环境变量后 install）
+> set npm_config_better_sqlite3_binary_host=https://npmmirror.com/mirrors/better-sqlite3/
+> npm install
+>
+> # PowerShell 写法
+> $env:npm_config_better_sqlite3_binary_host="https://npmmirror.com/mirrors/better-sqlite3/"
+> npm install
+> ```
+> 若仍失败，可退而求其次本地编译：`npm install better-sqlite3 --build-from-source`（需 VS Build Tools）。
+> `sqlite-vec` 的预编译二进制本身是 npm 包，走 npmmirror 镜像即可获得（Windows x64 为 .dll），无需额外配置。
 
 ### 3. 运行扩展
 - 用 VS Code 打开 `codebase-index` 文件夹
@@ -83,8 +97,11 @@ codebase-index/
 ├── src/
 │   ├── extension.js        # 扩展入口（5 个命令）
 │   ├── clangd-client.js    # C/C++ 搜索跳转（clangd LSP）
-│   └── semantic-index.js   # 语义检索 + Merkle 增量索引
+│   ├── semantic-index.js   # 语义检索 + rerank + Merkle 增量（目录级+文件级）
+│   └── vector-store.js     # sqlite-vec 向量库（磁盘持久化 + KNN）
 ├── test-v2.js              # Merkle 增量 + jina-code 验证
+├── test-vector.js          # 向量库 + rerank + 重启恢复验证
+├── test-merkle-tree.js     # 目录级真 Merkle 树验证
 ├── test-final.js           # 真实项目最终验证
 └── test-semantic.js        # 语义精度专项验证
 ```

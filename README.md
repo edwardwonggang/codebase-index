@@ -6,9 +6,10 @@
 复刻 Cursor 核心能力的本地 VS Code 扩展，适用于 **Windows + VS Code + 代码/编译工具在 Linux 服务器（网络挂载 X 盘）** 的开发环境。
 
 1. **C/C++ 搜索与跳转**（符号搜索 + 定义跳转）— 通过 **clangd LSP**
-2. **codebase-indexing 语义检索**（自然语言搜代码）— 通过 **tree-sitter 分块 + 代码专用 embedding + 向量检索**
-3. **Merkle 增量索引** — 只索引变化文件，避免重扫慢速网络挂载盘
-4. **全文搜索**（ripgrep）
+2. **codebase-indexing 语义检索**（自然语言搜代码）— 通过 **tree-sitter 分块 + 代码专用 embedding + 向量库 KNN 检索 + rerank**
+3. **向量库存储** — sqlite-vec（本地嵌入式向量库）持久化向量，大仓库重启无需全量读回内存
+4. **Merkle 增量索引** — 目录级子树哈希 + 文件级哈希，只索引变化文件，避免重扫慢速网络挂载盘
+5. **全文搜索**（ripgrep）
 
 ## 架构
 
@@ -16,7 +17,8 @@
 ┌─────────────────────────── codebase-index 扩展 ───────────────────────────┐
 │  clangd-client.js   →  clangd LSP（符号搜索 workspace/symbol + 定义跳转）    │
 │  semantic-index.js  →  tree-sitter 语法分块 + jina-code(代码专用) embedding │
-│                        + 余弦 KNN 检索 + Merkle 增量索引(SHA-256)           │
+│                        + rerank 精排 + Merkle 增量（目录级+文件级）          │
+│  vector-store.js    →  sqlite-vec 向量库（磁盘持久化 + KNN 检索）            │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -32,8 +34,9 @@
 
 ## 环境适配（Windows + X 盘网络挂载）
 
-- **Merkle 增量索引**：每个文件算 SHA-256，哈希未变不重新 embedding → 慢速网络盘只扫一次文件列表，不重复读内容
-- **索引状态持久化**：`.codebase-index/merkle-state.json`（工作区内，重启不丢）
+- **Merkle 增量索引**：目录级子树哈希（整目录未变直接跳过，不读内容不跑 embedding）+ 文件级 SHA-256（精确定位变化文件）→ 慢速网络盘只扫变化部分
+- **向量库持久化**：`.codebase-index/vec.db`（sqlite-vec），向量落盘，重启秒开、不重算 embedding；`merkle-state.json` 只存哈希（不再塞全量向量）
+- **rerank 精排**：向量 KNN 初选 + 查询词元与代码内容重叠度混合重排，对标 Cursor 的 rerank 环节
 - **网络盘健壮性**：文件遍历逐个 try/catch，不可读目录跳过
 - **路径**：用 `path` 模块处理 Windows 分隔符；语义搜索结果跨 `/` 和 `\` 取文件名
 

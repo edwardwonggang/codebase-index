@@ -79,25 +79,16 @@ async function activate(context) {
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Codebase 索引中...' }, async (progress) => {
       const idx = await getSemIndex(root);
       const files = collectFiles(root);
-      // Merkle 增量：只处理哈希变化的文件（避免重扫慢速网络盘 X）
+      // Merkle 增量（目录级子树哈希快速跳过未变目录 + 文件级精确跳过未变文件，避免重扫慢速 X 盘）
       const detectLang = (f) => (/\.(c)$/i.test(f) ? 'c' : 'cpp');
+      const stats = await idx.incrementalIndex(files, detectLang, ({ doneDirs, totalDirs, stats: s }) => {
+        progress.report({ message: `处理目录 ${doneDirs}/${totalDirs}, 新增 ${s.indexed}, 未变 ${s.unchanged}, 共 ${idx.store ? idx.store.count() : idx.chunks.length} 块` });
+      });
       const total = files.length;
-      let done = 0;
-      const stats = { indexed: 0, unchanged: 0, removed: 0, chunks: 0 };
-      for (let i = 0; i < total; i++) {
-        const n = await idx.indexFile(files[i], detectLang(files[i]));
-        if (n > 0) { stats.indexed++; stats.chunks += n; }
-        else if (idx.merkleState[files[i]]) stats.unchanged++;
-        else stats.indexed++;
-        done++;
-        if (i % 20 === 0) progress.report({ message: `${done}/${total} 文件, 新增 ${stats.indexed} 变化, ${idx.chunks.length} 块` });
-      }
-      // 清理已删除文件的块（Merkle 删除）
-      const seen = new Set(files);
-      for (const f of Object.keys(idx.merkleState)) {
-        if (!seen.has(f)) idx.removeFile(f);
-      }
-      vscode.window.showInformationMessage(`索引完成: 扫描 ${total} 文件, 新增/变化 ${stats.indexed}, 未变 ${stats.unchanged}, 共 ${idx.chunks.length} 代码块`);
+      vscode.window.showInformationMessage(
+        `索引完成: 扫描 ${total} 文件, 覆盖目录 ${Object.keys(idx.dirMerkle).length} 个, ` +
+        `新增/变化 ${stats.indexed}, 未变 ${stats.unchanged}, 整目录跳过 ${stats.dirsSkipped}, 共 ${idx.store ? idx.store.count() : idx.chunks.length} 代码块`
+      );
     });
   });
 
@@ -105,7 +96,8 @@ async function activate(context) {
   const semCmd = vscode.commands.registerCommand('codebaseIndex.semanticSearch', async () => {
     const ws = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
     const idx = await getSemIndex(ws ? ws.uri.fsPath : null);
-    if (idx.chunks.length === 0) {
+    const hasIndex = idx.store ? idx.store.count() > 0 : idx.chunks.length > 0;
+    if (!hasIndex) {
       vscode.window.showWarningMessage('请先运行 "Codebase Index: 索引工作区"');
       return;
     }
